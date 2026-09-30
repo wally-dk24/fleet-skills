@@ -26,6 +26,16 @@ import sys
 VERSION = "0.1.0"
 DEFAULT_LEDGER = os.path.join(os.path.expanduser("~"), ".fleet", "runs.jsonl")
 
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+def _default_skills_dir():
+    """The skills registry next to this script, unless $FLEET_SKILLS overrides it.
+
+    This makes `fleet list` / `fleet run` work from any working directory —
+    the old `./skills` default only worked when run from the repo root.
+    """
+    return os.environ.get("FLEET_SKILLS") or os.path.join(_SCRIPT_DIR, "skills")
+
 # ---------------------------------------------------------------------------
 # Safety heuristics — extend this list to sharpen classification.
 # Each entry: (compiled regex, class). First match wins.
@@ -439,6 +449,10 @@ def cmd_run(args):
 
 def cmd_list(args):
     skills_dir = os.path.abspath(args.skills_dir)
+    if not os.path.isdir(skills_dir):
+        print(f"fleet: no skills registry at {skills_dir} "
+              f"(set --skills-dir or $FLEET_SKILLS)", file=sys.stderr)
+        return 1
     reg = os.path.join(skills_dir, "SKILLS.md")
     if os.path.isfile(reg):
         with open(reg, encoding="utf-8") as f:
@@ -487,8 +501,8 @@ def main(argv=None):
     raw = list(sys.argv[1:] if argv is None else argv)
     raw, passthrough = split_run_passthrough(raw)
     ap = argparse.ArgumentParser(prog="fleet", description=__doc__.splitlines()[0])
-    ap.add_argument("--skills-dir", default=os.environ.get("FLEET_SKILLS", "./skills"),
-                    help="skills directory (default: $FLEET_SKILLS or ./skills)")
+    ap.add_argument("--skills-dir", default=_default_skills_dir(),
+                    help="skills directory (default: $FLEET_SKILLS or the skills/ dir next to the fleet script)")
     ap.add_argument("--version", action="version", version=f"fleet {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -498,7 +512,8 @@ def main(argv=None):
 
     p = sub.add_parser("gen", help="generate SKILL.md per script + SKILLS.md registry")
     p.add_argument("dir", nargs="?", default=".", help="directory to scan")
-    p.add_argument("--out", default="./skills", help="output directory for skills")
+    p.add_argument("--out", default=_default_skills_dir(),
+                   help="output directory for skills (default: the skills/ dir next to the fleet script)")
     p.set_defaults(func=cmd_gen)
 
     p = sub.add_parser("run", help="run a skill (logs to ~/.fleet/runs.jsonl)")
