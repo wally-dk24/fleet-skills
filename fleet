@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""fleet — turn a directory of personal helper scripts into self-describing agent skills.
+
+Commands:
+  fleet scan [dir]            find executable scripts + cron definitions, print a table (writes nothing)
+  fleet gen [dir] --out DIR   generate one SKILL.md per script + a SKILLS.md registry
+  fleet run <skill> [--dry-run] [-- args...]
+                              run a skill; every real run is appended to ~/.fleet/runs.jsonl
+  fleet list                  list skills in the registry
+  fleet show <skill>           print a skill's SKILL.md
+
+Safety: skills classified "destructive" refuse to run unless the skill directory
+contains an empty file named ALLOW_DESTRUCTIVE. Env var NAMES are recorded;
+secret VALUES are never printed or stored.
+"""
+import argparse
+import ast
+import datetime
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+VERSION = "0.1.0"
+DEFAULT_LEDGER = os.path.join(os.path.expanduser("~"), ".fleet", "runs.jsonl")
+
+# ---------------------------------------------------------------------------
+# Safety heuristics — extend this list to sharpen classification.
+# Each entry: (compiled regex, class). First match wins.
+# ---------------------------------------------------------------------------
+_CMD_POS = r"(?:^|[;|&]|\$\(|`)\s*"  # shell command position (start of line or after a separator)
+
+SAFETY_HEURISTICS = [
+    (re.compile(r"\brm\s+[^\n]*-[a-z]*r", re.I), "destructive"),
+    (re.compile(r":\(\)\s*\{\s*:|\s*:\s*&\s*\}\s*;\s*:"), "destructive"),  # fork bomb
+    (re.compile(r"\b(mkfs|shred|wipefs)\b", re.I), "destructive"),
+    (re.compile(r"\bdd\s+[^\n]*\bof=", re.I), "destructive"),
+    (re.compile(r"\bDROP\s+TABLE\b", re.I), "destructive"),
+    (re.compile(r"\bDELETE\s+FROM\b", re.I), "destructive"),
+    (re.compile(r"\bTRUNCATE\s+(TABLE\s+)?\w", re.I), "destructive"),
+    (re.compile(r"\bapt(-get)?\s+(remove|purge|autoremove)\b", re.I), "destructive"),
+    (re.compile(r"\bkill\s+-9\b"), "destructive"),
+    (re.compile(r"\b(shutdown|reboot|halt|poweroff)\b", re.I), "destructive"),
+    (re.compile(r"\b(podman|docker)\s+rm([i]|-f)?\b"), "destructive"),
+    (re.compile(r"\bpodman\s+rmi\b"), "destructive"),
+    (re.compile(r"\$(?:\{)?[A-Z_]*(?:PODMAN|DOCKER)[A-Z_]*\}?\s+rm([i]|-f)?\b"), "destructive"),
+    (re.compile(r"\$(?:\{)?[A-Z_]*(?:PODMAN|DOCKER)[A-Z_]*\}?\s+(load|run|build)\b"), "writes-files"),
+    (re.compile(r">>\s*\S"), "writes-files"),
+    (re.compile(r"open\([^)]*['\"][wa]"), "writes-files"),
+    (re.compile(r"\.(dump|dumps)\s*\("), "writes-files"),
+    (re.compile(r"\b(INSERT\s+INTO|UPDATE\s+\w+\s+SET)\b", re.I), "writes-files"),
+    (re.compile(_CMD_POS + r"(mkdir|touch|cp|mv|ln)(?=\s)", re.M), "writes-files"),
+    (re.compile(r"\bapt(-get)?\s+install\b", re.I), "writes-files"),
+    (re.compile(r"\bpodman\s+(load|run|build)\b"), "writes-files"),
+    (re.compile(r"\bcurl\b[^\n]*(-o\b|--output\b)"), "writes-files"),
+    (re.compile(r"\bwget\b[^\n]*-O\b"), "writes-files"),
+    (re.compile(_CMD_POS + r"flock(?=\s)", re.M), "writes-files"),
+    (re.compile(r"os\.makedirs|Path\([^)]*\)\.write_text|write_bytes"), "writes-files"),
+]
+
+SHELL_ENV_STOOPLIST = {
+    "PATH", "HOME", "USER", "SHELL", "PWD", "OLDPWD", "LANG", "LC_ALL",
+    "TERM", "EDITOR", "TMPDIR", "TZ",
+}
+
+
+def classify_safety(text):
+    """Return (class, matched_pattern_source). Default: read-only."""
+    for rx, cls in SAFETY_HEURISTICS:
+        if rx.search(text):
+            return cls, rx.pattern
+    return "read-only", ""
+
+
+def skill_name_for(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    name = re.sub(r"[^a-zA-Z0-9]+", "-", stem).strip("-").lower()
+    return name or "unnamed"
+
+
+def read_text(path, limit=200_000):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(limit)
+    except OSError:
+        return ""
+
+
+SKIP_DIR_NAMES = {
+    ".git", "__pycache__", ".venv", "node_modules", "profile",
+    "site-packages", ".tox", "dist", "build", "eggs", "__pypackages__",
+}
+
+
+def _skip_dir(dirpath):
+    segs = dirpath.split(os.sep)
+    return any(s in SKIP_DIR_NAMES or "venv" in s for s in segs)
+
+
+def has_shebang_or_exec(path):
+    if os.access(path, os.X_OK):
+        return True
+    with open(path, "rb") as f:
+        return f.read(2) == b"#!"
+
+
+def py_docstring(text):
+    try:
+        tree = ast.parse(text)
+        doc = ast.get_docstring(tree)
+        return doc or ""
+    except SyntaxError:
+        return ""
+
+
+def sh_header_comment(text):
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("#!"):
+            continue
+        if s.startswith("#"):
+            lines.append(s.lstrip("#").strip())
+        elif not s:
+            continue
+        else:
+            break
+        if len(lines) > 25:
+            break
+    return "\n".join(lines)
+
+
+def extract_usage(doc):
+    m = re.search(r"(?im)^\s*usage\s*:\s*(.+?)(?:\n\s*\n|\Z)", doc, re.S)
+    if m:
+        return " ".join(m.group(1).split())
+    return ""
+
+
+def extract_args(text):
+    """Find argparse/click-style options. Returns list of (flag, help)."""
+    args = []
+    for m in re.finditer(
+        r"add_argument\(\s*(['\"])(--?[A-Za-z0-9_-]+)\1\s*(?:,\s*(['\"])(--?[A-Za-z0-9_-]+)\3)?"
+        r"[^)]*?help\s*=\s*(['\"])(.*?)\5",
+        text, re.S,
+    ):
+        flags = [g for g in (m.group(2), m.group(4)) if g]
+        args.append((", ".join(flags), m.group(6).strip()))
+    for m in re.finditer(
+        r"add_argument\(\s*(['\"])(--?[A-Za-z0-9_-]+)\1\s*(?:,\s*(['\"])(--?[A-Za-z0-9_-]+)\3)?[^)]*\)",
+        text, re.S,
+    ):
+        flags = [g for g in (m.group(2), m.group(4)) if g]
+        if not any(f == ", ".join(flags) for f, _ in args):
+            args.append((", ".join(flags), ""))
+    for m in re.finditer(
+        r"@click\.option\(\s*(['\"])(--?[A-Za-z0-9_-]+)\1[^)]*?help\s*=\s*(['\"])(.*?)\3",
+        text, re.S,
+    ):
+        args.append((m.group(2), m.group(4).strip()))
+    # dedupe, keep order
+    seen, out = set(), []
+    for f, h in args:
+        if f not in seen:
+            seen.add(f)
+            out.append((f, h))
+    return out
+
+
+def extract_env_names(text):
+    names = set()
+    for pat in (
+        r"os\.environ\.get\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]",
+        r"os\.getenv\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]",
+        r"os\.environ\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]",
+        r"ENV\[\s*['\"]([A-Z][A-Z0-9_]*)['\"]",
+    ):
+        names.update(re.findall(pat, text))
+    for m in re.finditer(r"\$\{([A-Z][A-Z0-9_]*)(?::[^}]*)?\}|\$([A-Z][A-Z0-9_]*)", text):
+        n = m.group(1) or m.group(2)
+        if n and n not in SHELL_ENV_STOOPLIST:
+            names.add(n)
+    return sorted(names)
+
+
+def extract_exit_codes(text, doc=""):
+    codes = {}  # code -> meaning
+    for c in re.findall(r"sys\.exit\(\s*(\d+)", text):
+        if int(c) < 128:
+            codes.setdefault(int(c), "")
+    for c in re.findall(r"(?<![\w.])exit\s+(\d+)", text):
+        if int(c) < 128:
+            codes.setdefault(int(c), "")
+    # documented exit codes, e.g. "Exit codes: 0 on success, 1 if the file is missing"
+    for line in doc.splitlines():
+        if not re.search(r"exit\s+codes?", line, re.I):
+            continue
+        for seg in re.split(r"[,;]", line):
+            m = re.search(r"(\d+)\s+(?:on|if|when|[-:=])\s*(.+)", seg)
+            if m and int(m.group(1)) < 128:
+                meaning = m.group(2).strip().rstrip(".")
+                if not re.search(r"\b(version|python|http|port)\b", meaning, re.I):
+                    codes.setdefault(int(m.group(1)), meaning)
+    return sorted(codes.items())
+
+
+def analyze_script(path):
+    text = read_text(path)
+    is_py = path.endswith(".py")
+    doc = py_docstring(text) if is_py else sh_header_comment(text)
+    first_line = doc.strip().splitlines()[0] if doc.strip() else ""
+    usage = extract_usage(doc) or (
+        f"{os.path.basename(path)} [options]" if extract_args(text) else os.path.basename(path)
+    )
+    safety, matched = classify_safety(text)
+    return {
+        "path": os.path.abspath(path),
+        "name": skill_name_for(path),
+        "kind": "script",
+        "language": "python" if is_py else "shell",
+        "description": first_line,
+        "usage": usage,
+        "args": extract_args(text),
+        "env": extract_env_names(text),
+        "exit_codes": extract_exit_codes(text, doc),
+        "safety": safety,
+        "safety_evidence": matched,
+    }
+
+
+def find_cron_definitions(root):
+    """Yield (path, schedule_hint) for cron definition files/dirs."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        base = os.path.basename(dirpath)
+        if base in ("cron.d", "crons"):
+            # collect every file under the cron tree (schedules live in subdirs)
+            for d2, _dn2, fns2 in os.walk(dirpath):
+                for fn in sorted(fns2):
+                    if re.search(r"\.\d+$", fn):
+                        continue  # editor backup files
+                    found.append((os.path.join(d2, fn), cron_hint(fn)))
+            dirnames[:] = []  # don't let the outer walk descend again
+            continue
+        for fn in filenames:
+            if "cron" in fn.lower() and fn.endswith((".md", ".txt", ".yaml", ".yml", ".json", ".sh")):
+                found.append((os.path.join(dirpath, fn), cron_hint(fn)))
+    return found
+
+
+def cron_hint(filename):
+    """Extract a schedule hint from names like job__interval@5m.md or job__daily@06:00.md."""
+    m = re.search(r"__([A-Za-z]+)@([^.]+)\.", filename)
+    if m:
+        return f"{m.group(1)} @ {m.group(2)}"
+    return "cron file"
+
+
+def scan_dir(root):
+    root = os.path.abspath(root)
+    scripts = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if _skip_dir(dirpath):
+            continue
+        for fn in sorted(filenames):
+            if fn.endswith((".sh", ".py")):
+                p = os.path.join(dirpath, fn)
+                if has_shebang_or_exec(p):
+                    scripts.append(p)
+    crons = find_cron_definitions(root)
+    return scripts, crons
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+def cmd_scan(args):
+    scripts, crons = scan_dir(args.dir)
+    print(f"# fleet scan: {os.path.abspath(args.dir)}")
+    print(f"# {len(scripts)} scripts, {len(crons)} cron definitions (read-only, nothing written)\n")
+    print(f"{'SKILL NAME':28} {'KIND':8} {'SAFETY':12} DESCRIPTION")
+    print("-" * 100)
+    for p in scripts:
+        info = analyze_script(p)
+        desc = (info["description"][:52] + "…") if len(info["description"]) > 53 else info["description"]
+        print(f"{info['name']:28} {'script':8} {info['safety']:12} {desc}")
+    for p, hint in crons:
+        rel = os.path.relpath(p, os.path.abspath(args.dir))
+        print(f"{skill_name_for(p):28} {'cron':8} {'read-only':12} {rel} ({hint})")
+    return 0
+
+
+def render_skill_md(info):
+    lines = []
+    lines.append("---")
+    lines.append(f"skill: {info['name']}")
+    lines.append(f"source: {info['path']}")
+    lines.append(f"language: {info['language']}")
+    lines.append(f"safety: {info['safety']}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {info['name']}")
+    lines.append("")
+    lines.append(info["description"] or "(no description found in source)")
+    lines.append("")
+    lines.append("## Usage")
+    lines.append("")
+    lines.append(f"    {info['usage']}")
+    lines.append("")
+    lines.append("## Arguments")
+    lines.append("")
+    if info["args"]:
+        lines.append("| Flag | Help |")
+        lines.append("| ---- | ---- |")
+        for flag, help_ in info["args"]:
+            lines.append(f"| `{flag}` | {help_} |")
+    else:
+        lines.append("(no CLI arguments detected in source)")
+    lines.append("")
+    lines.append("## Environment")
+    lines.append("")
+    if info["env"]:
+        lines.append("Referenced variable **names** only — values are never stored here.")
+        lines.append("")
+        for e in info["env"]:
+            lines.append(f"- `{e}`")
+    else:
+        lines.append("(no environment variables detected)")
+    lines.append("")
+    lines.append("## Exit codes")
+    lines.append("")
+    codes = info["exit_codes"]
+    if codes:
+        lines.append("Detected in source:")
+        lines.append("")
+        for code, meaning in codes:
+            lines.append(f"- `{code}`" + (f" — {meaning}" if meaning else ""))
+        lines.append("")
+    lines.append("Convention: `0` = success, non-zero = failure.")
+    lines.append("")
+    lines.append("## Safety")
+    lines.append("")
+    lines.append(f"Classification: **{info['safety']}**")
+    if info["safety_evidence"]:
+        lines.append(f"Evidence pattern: `{info['safety_evidence']}`")
+    if info["safety"] == "destructive":
+        lines.append("`fleet run` refuses this skill unless the skill directory contains")
+        lines.append("an empty file named `ALLOW_DESTRUCTIVE`.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_gen(args):
+    scripts, _crons = scan_dir(args.dir)
+    out = os.path.abspath(args.out)
+    os.makedirs(out, exist_ok=True)
+    infos = [analyze_script(p) for p in scripts]
+    for info in infos:
+        sdir = os.path.join(out, info["name"])
+        os.makedirs(sdir, exist_ok=True)
+        with open(os.path.join(sdir, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write(render_skill_md(info))
+    # registry
+    reg = ["# Skills registry", "",
+           f"Generated by `fleet gen` from `{os.path.abspath(args.dir)}`.", "",
+           "| Skill | Safety | Description |", "| ----- | ------ | ----------- |"]
+    for info in infos:
+        desc = info["description"].replace("|", "\\|")
+        reg.append(f"| `{info['name']}` | {info['safety']} | {desc} |")
+    reg.append("")
+    with open(os.path.join(out, "SKILLS.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(reg))
+    print(f"Generated {len(infos)} skills in {out} (+ SKILLS.md registry)")
+    return 0
+
+
+def load_skill(skills_dir, name):
+    sdir = os.path.join(skills_dir, name)
+    md = os.path.join(sdir, "SKILL.md")
+    if not os.path.isfile(md):
+        return None, None
+    meta = {}
+    with open(md, encoding="utf-8") as f:
+        in_head = False
+        for line in f:
+            s = line.strip()
+            if s == "---":
+                if not in_head:
+                    in_head = True
+                    continue
+                break
+            if in_head and ":" in s:
+                k, v = s.split(":", 1)
+                meta[k.strip()] = v.strip()
+    return sdir, meta
+
+
+def cmd_run(args):
+    skills_dir = os.path.abspath(args.skills_dir)
+    sdir, meta = load_skill(skills_dir, args.skill)
+    if not meta:
+        print(f"fleet: skill '{args.skill}' not found in {skills_dir}", file=sys.stderr)
+        return 2
+    safety = meta.get("safety", "read-only")
+    if safety == "destructive" and not os.path.isfile(os.path.join(sdir, "ALLOW_DESTRUCTIVE")):
+        print(f"fleet: REFUSED — skill '{args.skill}' is classified destructive.", file=sys.stderr)
+        print("fleet: create an empty file named ALLOW_DESTRUCTIVE in the skill directory to allow it.",
+              file=sys.stderr)
+        return 3
+    src = meta.get("source", "")
+    if not src or not os.path.isfile(src):
+        print(f"fleet: source script missing: {src}", file=sys.stderr)
+        return 2
+    cmd = [src] + list(args.args)
+    if args.dry_run:
+        print("dry-run:", " ".join(shlex.quote(c) for c in cmd))
+        return 0
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        rc, out, err = proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        rc, out, err = 124, "", "fleet: timed out after 600s"
+    except OSError as e:
+        rc, out, err = 127, "", f"fleet: exec failed: {e}"
+    if out:
+        sys.stdout.write(out)
+    if err:
+        sys.stderr.write(err)
+    os.makedirs(os.path.dirname(DEFAULT_LEDGER), exist_ok=True)
+    entry = {"ts": started, "skill": args.skill, "args": list(args.args), "exit": rc}
+    with open(DEFAULT_LEDGER, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+    return 0
+
+
+def cmd_list(args):
+    skills_dir = os.path.abspath(args.skills_dir)
+    reg = os.path.join(skills_dir, "SKILLS.md")
+    if os.path.isfile(reg):
+        with open(reg, encoding="utf-8") as f:
+            print(f.read(), end="")
+        return 0
+    names = sorted(d for d in os.listdir(skills_dir)
+                   if os.path.isfile(os.path.join(skills_dir, d, "SKILL.md")))
+    for n in names:
+        print(n)
+    return 0
+
+
+def cmd_show(args):
+    sdir, meta = load_skill(os.path.abspath(args.skills_dir), args.skill)
+    if not meta:
+        print(f"fleet: skill '{args.skill}' not found", file=sys.stderr)
+        return 2
+    with open(os.path.join(sdir, "SKILL.md"), encoding="utf-8") as f:
+        print(f.read(), end="")
+    return 0
+
+
+def split_run_passthrough(argv):
+    """For `fleet run`, split off everything after the first bare `--`
+    before argparse sees it (argparse mishandles `--` after optionals).
+    Returns (argv_for_argparse, passthrough_args)."""
+    argv = list(argv)
+    i = 0
+    # find the subcommand: first token that isn't a flag or a flag value
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--skills-dir":
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        break
+    if i < len(argv) and argv[i] == "run" and "--" in argv[i:]:
+        j = argv.index("--", i)
+        return argv[:j], argv[j + 1:]
+    return argv, []
+
+
+def main(argv=None):
+    raw = list(sys.argv[1:] if argv is None else argv)
+    raw, passthrough = split_run_passthrough(raw)
+    ap = argparse.ArgumentParser(prog="fleet", description=__doc__.splitlines()[0])
+    ap.add_argument("--skills-dir", default=os.environ.get("FLEET_SKILLS", "./skills"),
+                    help="skills directory (default: $FLEET_SKILLS or ./skills)")
+    ap.add_argument("--version", action="version", version=f"fleet {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("scan", help="find scripts + cron definitions, print a table (writes nothing)")
+    p.add_argument("dir", nargs="?", default=".", help="directory to scan")
+    p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("gen", help="generate SKILL.md per script + SKILLS.md registry")
+    p.add_argument("dir", nargs="?", default=".", help="directory to scan")
+    p.add_argument("--out", default="./skills", help="output directory for skills")
+    p.set_defaults(func=cmd_gen)
+
+    p = sub.add_parser("run", help="run a skill (logs to ~/.fleet/runs.jsonl)")
+    p.add_argument("skill", help="skill name")
+    p.add_argument("--dry-run", action="store_true", help="print the exact command, do not execute")
+    p.add_argument("args", nargs="*", help="arguments passed to the skill (use -- to separate)")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("list", help="list skills")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("show", help="print a skill's SKILL.md")
+    p.add_argument("skill", help="skill name")
+    p.set_defaults(func=cmd_show)
+
+    args = ap.parse_args(raw)
+    if passthrough:
+        args.args = list(getattr(args, "args", []) or []) + passthrough
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
